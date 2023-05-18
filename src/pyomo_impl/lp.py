@@ -1,3 +1,4 @@
+import math
 import pyomo.environ as pe
 from ..shared_model import *
 from ..shared_model.OM_costing import cost_DAC_FOM
@@ -5,13 +6,26 @@ from ..pyomo_model.params import *
 
 cycle_time = 0.75
 
-def create(times, decisions, cost_ng, co2_credit, power_price):
+def create_orig(times, decisions, cost_ng, co2_credit, power_price):
     m = pe.ConcreteModel()
 
     add_sets(m, times, decisions)
     add_vars(m)
     add_constraints(m)
-    add_objective(m, cost_ng, co2_credit, power_price)
+    add_exprs(m, cost_ng, co2_credit, power_price)
+    add_objective_orig(m, cost_ng, co2_credit, power_price)
+    return m
+
+def create_test1(times, decisions, cost_ng, co2_credit, power_price):
+    m = pe.ConcreteModel()
+
+    add_sets(m, times, decisions)
+    add_vars(m)
+    m.air_adsorb_max.fix(47795)
+    m.sorbent_total.fix(2990)
+    add_tank_constraints(m)
+    add_exprs(m, cost_ng, co2_credit, power_price)
+    add_objective_test1(m, cost_ng, co2_credit, power_price)
     return m
 
 def add_vars(m):
@@ -21,6 +35,19 @@ def add_vars(m):
     m.dsorbent_A       = pe.Var(m.dac_decisions, bounds=(0, None))
     m.tsteam_DAC_extra = pe.Var(m.steam_times,  bounds=(0, None))
     m.tload            = pe.Var(m.steam_times,  bounds=(50, 100))
+
+# decicion# * cycle_time = time cycle starts
+# so if we want all decision # within an hour, note that
+# time / cycletime ≤ decision# < (time+1)/cycletime
+# decisions availible is all ints which fit this
+# |decisions| = ceil((t+1)/cycle_time - ceil(t/cycle_time)) - 1
+def t_to_d_map(t):
+    d = int(math.ceil(t/cycle_time))
+    d_end = (t+1)/cycle_time
+    while d < d_end:
+        yield d
+        d += 1
+    return
 
 def add_sets(m, times, decisions):
     m.steam_times = pe.Set(initialize=times)
@@ -45,55 +72,87 @@ def add_constraints(m):
         return sum(m.dsorbent_A[d] for d in other_dacs) <= m.sorbent_total
     m.dont_overcommit_dac = pe.Constraint(m.dac_decisions, rule=dont_overcommit_dac)
 
-def add_objective(m, cost_NG, CO2_CREDIT, power_price):
-    def obj(m):
-        return obj_expr(m, cost_NG, CO2_CREDIT, power_price)
-    m.obj = pe.Objective(rule=obj, sense=-1)
+def add_tank_constraints(m):
+    def air_lt_max(m, d):
+        return m.air_adsorb_max >= dair_adsorb(m.dsorbent_A[d])/15/60
+    m.air_lt_max = pe.Constraint(m.dac_decisions, rule=air_lt_max)
+
+    def dont_overuse_steam(m, t):
+        return tsteam_DAC_total(m.tload[t], m.tsteam_DAC_extra[t], 1) >= pe.quicksum(
+            dsteam_DAC(m.dsorbent_A[d]) for d in t_to_d_map(t)
+        )
+    m.dont_overuse_steam = pe.Constraint(m.steam_times, rule=dont_overuse_steam)
+
+    def dont_overcommit_steam(m, t):
+        return tsteam_allocable(m.tload[t], 1) >= m.tsteam_DAC_extra[t]
+    m.dont_overcommit_steam = pe.Constraint(m.steam_times, rule=dont_overcommit_steam)
+
+    def dont_overcommit_dac(m, d):
+        return m.dsorbent_A[d] <= m.sorbent_total
+    m.dont_overcommit_dac = pe.Constraint(m.dac_decisions, rule=dont_overcommit_dac)
+
+def add_exprs(m, cost_NG, CO2_CREDIT, power_price):
+    def fuel_cost_rule(m, t):
+        return tfuel_cost(m.tload[t], cost_NG)
+    m.fuel_cost = pe.Expression(m.steam_times, rule=fuel_cost_rule)
+    
+    def tco2_cap_rule(m, t):
+        return tco2_cap(m.tload[t], CO2_CREDIT)
+    m.tco2_cap = pe.Expression(m.steam_times, rule=tco2_cap_rule)
+
+    def tco2_compr_rule(m, t):
+        return tco2_compr(m.tload[t])
+    m.tco2_compr = pe.Expression(m.steam_times, rule=tco2_compr_rule)
+
+    def tpower_cost_rule(m, t):
+        return tpower_cost(m.tload[t], m.tsteam_DAC_extra[t], power_price[t])
+    m.tpower_cost = pe.Expression(m.steam_times, rule=tpower_cost_rule)
+
+    def tvom_cost_rule(m, t):
+        return tvom_cost(m.tload[t])
+    m.tvom_cost = pe.Expression(m.steam_times, rule=tvom_cost_rule)
+
+    def dco2_cap_rule(m, d):
+        return dco2_cap(m.dsorbent_A[d], CO2_CREDIT)
+    m.dco2_cap = pe.Expression(m.dac_decisions, rule=dco2_cap_rule)
+
+    def dco2_compr_rule(m, d):
+        return dco2_compr(m.dsorbent_A[d])
+    m.dco2_compr = pe.Expression(m.dac_decisions, rule=dco2_compr_rule)
+
+    def ddac_power_rule(m, d):
+        return ddac_power(m.dsorbent_A[d], power_price[math.floor(d*cycle_time)]) 
+    m.ddac_power = pe.Expression(m.dac_decisions, rule=ddac_power_rule)
+
+    def dcompr_power_rule(m, d):
+        return dcompr_power(m.dsorbent_A[d], power_price[math.floor(d*cycle_time)])
+    m.dcompr_power = pe.Expression(m.dac_decisions, rule=dcompr_power_rule)
+
+    def dvom_cost_rule(m, d):
+        return dvom_cost(m.dsorbent_A[d]) 
+    m.dvom_cost = pe.Expression(m.dac_decisions, rule=dvom_cost_rule)
+
+def add_objective_test1(m, cost_NG, CO2_CREDIT, power_price):
+    def obj_expr(m,t):
+        return - m.fuel_cost[t] + \
+                m.tco2_cap[t] - \
+                m.tco2_compr[t] + \
+                m.tpower_cost[t] - \
+                m.tvom_cost[t] + \
+                pe.quicksum(
+                    m.dco2_cap[d] - \
+                    m.dco2_compr[d] - \
+                    m.ddac_power[d] - \
+                    m.dcompr_power[d] - \
+                    m.dvom_cost[d]
+                for d in t_to_d_map(t))
+    m.obj_expr = pe.Expression(m.steam_times, rule=obj_expr)
+    m.obj = pe.Objective(sense=-1, expr=pe.quicksum(m.obj_expr.values()))
 
 nhours = 12 * 24 * 30 +1
-def obj_expr(m, cost_NG, CO2_CREDIT, power_price):
-    def fuel_cost(m, t):
-        return cost_NG * (a_fuel * m.tload[t] + b_fuel)
-    m.fuel_cost = pe.Expression(m.steam_times, rule=fuel_cost)
-    
-    def tco2_cap(m, t):
-        return CO2_CREDIT * tCO2_cap_total(m.tload[t])
-    m.tco2_cap = pe.Expression(m.steam_times, rule=tco2_cap)
+def add_objective_orig(m, cost_NG, CO2_CREDIT, power_price):
 
-    def tco2_compr(m, t):
-        return a_cost_CO2_TS * tCO2_compress(m.tload[t])
-    m.tco2_compr = pe.Expression(m.steam_times, rule=tco2_compr)
-
-    def tpower_cost(m, t):
-        return power_price[t] * tpower_net(m.tload[t], m.tload[t], m.tsteam_DAC_extra[t], 1, 1)
-    m.tpower_cost = pe.Expression(m.steam_times, rule=tpower_cost)
-
-    def tvom_cost(m, t):
-        return tcost_NGCC_VOM(m.tload[t]) + tcost_PCC_VOM(m.tload[t]) + tcost_PCC_compr_VOM(m.tload[t])
-    m.tvom_cost = pe.Expression(m.steam_times, rule=tvom_cost)
-
-    def dco2_cap(m, d):
-        return CO2_CREDIT * dCO2_cap_total(m.dsorbent_A[d])
-    m.dco2_cap = pe.Expression(m.dac_decisions, rule=dco2_cap)
-
-    def dco2_compr(m, d):
-        return a_cost_CO2_TS * dCO2_compress(m.dsorbent_A[d])
-    m.dco2_compr = pe.Expression(m.dac_decisions, rule=dco2_compr)
-
-    def ddac_power(m, d):
-        #return (power_price[int(d//4)]+(power_price[int((d+1)//4)] if int((d+1)//4) < nhours else 0))/2 * dpower_DAC(m.dsorbent_A[d]) 
-        return (power_price[int(d//4)]+power_price[int((d+1)//4)])/2 * dpower_DAC(m.dsorbent_A[d]) 
-    m.ddac_power = pe.Expression(m.dac_decisions, rule=ddac_power)
-
-    def dcompr_power(m, d):
-        #return (power_price[int((d+2)//4)]/4 if int((d+2)//4) < nhours else 0) * dpower_compress(m.dsorbent_A[d]) 
-        return power_price[int((d+2)//4)] * dpower_compress(m.dsorbent_A[d]) 
-    m.dcompr_power = pe.Expression(m.dac_decisions, rule=dcompr_power)
-
-    def dvom_cost(m, d):
-        return dcost_DAC_VOM(m.dsorbent_A[d]) + dcost_DAC_compr_VOM(m.dsorbent_A[d])
-    m.dvom_cost = pe.Expression(m.dac_decisions, rule=dvom_cost)
-    return \
+    m.obj = pe.Objective(sense=-1, expr=
         ( sum(
              - m.fuel_cost[t] + \
                 m.tco2_cap[t] - \
@@ -108,6 +167,6 @@ def obj_expr(m, cost_NG, CO2_CREDIT, power_price):
                 m.dcompr_power[d] - \
                 m.dvom_cost[d]
             for d in m.dac_decisions)
-        - cost_DAC_FOM(m.air_adsorb_max, m.sorbent_total) ) * (1 - tax_r) * sum(1 / (1 + int_r) ** j for j in range(2, 21 + 1)) \
-        - cost_DAC_TPC(m.air_adsorb_max, m.sorbent_total) * (1 + 0.0311 + 0.0066 + 0.1779) * ( 0.3 + 0.7 / (1 + int_r) - sum(tax_r * depreciate_r * ((1 - depreciate_r) ** j) * ((1 + int_r) ** (- j - 2)) for j in range(19 + 1)) )
+        )) #- cost_DAC_FOM(m.air_adsorb_max, m.sorbent_total) ) * (1 - tax_r) * sum(1 / (1 + int_r) ** j for j in range(2, 21 + 1)) \
+        #- cost_DAC_TPC(m.air_adsorb_max, m.sorbent_total) * (1 + 0.0311 + 0.0066 + 0.1779) * ( 0.3 + 0.7 / (1 + int_r) - sum(tax_r * depreciate_r * ((1 - depreciate_r) ** j) * ((1 + int_r) ** (- j - 2)) for j in range(19 + 1)) ))
 

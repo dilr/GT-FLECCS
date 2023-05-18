@@ -24,8 +24,8 @@ from .disaggregated_constraints import tsteam_DAC_base, tsteam_allocable
     #def eq_steam_allocation(m, i):
     #    return m.x_steam_allocable[i] == m.x_steam_DAC_extra[i] + m.x_steam_LP[i]
     #m.eq_steam_allocation = Constraint(set_hour_0, rule=eq_steam_allocation)
-def tsteam_LP(tfake_load, tsteam_DAC_extra, disp):
-    return tsteam_allocable(tfake_load, disp) - tsteam_DAC_extra
+def tsteam_LP(tload, tsteam_DAC_extra, disp):
+    return tsteam_allocable(tload, disp) - tsteam_DAC_extra
 
     # --------------------------------------------------------------------------
 
